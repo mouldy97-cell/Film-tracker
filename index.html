@@ -123,6 +123,15 @@
     content:"";position:absolute;left:4px;top:0px;width:7px;height:13px;
     border:solid var(--stamp);border-width:0 2.5px 2.5px 0;transform:rotate(42deg);
   }
+  .poster{
+    flex:0 0 42px;width:42px;align-self:center;margin:8px 0 8px 9px;
+    aspect-ratio:2/3;border-radius:2px;overflow:hidden;
+    background:rgba(21,23,28,.07);border:1px solid rgba(21,23,28,.22);
+    display:flex;align-items:center;justify-content:center;
+    box-shadow:0 1px 2px rgba(21,23,28,.18);
+  }
+  .poster img{width:100%;height:100%;object-fit:cover;display:block}
+  .poster .pfallback{font-family:var(--serif);font-size:15px;font-weight:600;color:rgba(21,23,28,.32)}
   .body{flex:1;min-width:0;padding:10px 12px 11px;text-align:left;display:block;background:none}
   .titleline{font-family:var(--serif);font-size:16.5px;line-height:1.25;letter-spacing:.01em}
   .titleline .yr{color:rgba(21,23,28,.5);font-family:var(--mono);font-size:12px;margin-left:5px}
@@ -155,7 +164,10 @@
   /* expanded detail */
   .detail{background:rgba(21,23,28,.06);border-top:1px dashed rgba(21,23,28,.25);
           padding:11px 12px 12px;font-size:12.5px;color:rgba(21,23,28,.8)}
-  .detail dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0 0 10px}
+  .drow{display:flex;gap:12px;margin-bottom:2px}
+  .dposter{flex:0 0 66px;width:66px;aspect-ratio:2/3;border-radius:3px;object-fit:cover;
+    box-shadow:0 2px 6px rgba(21,23,28,.3);border:1px solid rgba(21,23,28,.25)}
+  .detail dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0 0 10px;align-content:start}
   .detail dt{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:rgba(21,23,28,.5);padding-top:1px}
   .detail dd{margin:0}
   .detail textarea{
@@ -321,13 +333,27 @@
     <textarea id="i-json" rows="5"></textarea>
     <button class="primary" id="i-apply">Restore</button>
   </div>
+
+  <div class="field" style="margin-top:16px">
+    <label for="m-tmdb">Poster art — TMDb API key</label>
+    <input id="m-tmdb" autocomplete="off" placeholder="Paste a free key to switch posters on">
+  </div>
+  <button class="ghost" id="m-tmdb-save">Save key</button>
+  <p class="note">
+    Poster art is pulled live from The Movie Database as you scroll, and cached on the phone
+    so it only loads once per film. A key is free — themoviedb.org → Settings → API →
+    Create → API Key (v3 auth), then paste it above. Without a key, cards just show a plain
+    initial in place of the art. The key stays on this device and is never included in a backup.
+  </p>
+
   <p class="note">
     <b>Sources.</b> The main list is the 1,000 Greatest Films poll compiled by
     They Shoot Pictures, Don't They (the spreadsheet you supplied, 2025 edition), which aggregates
     critics' and directors' ballots. Merged into it is a snapshot of the IMDb Top 250, the
     audience-voted list, which adds 95 films the critics' poll leaves out. Where a film appears on
     both, the card shows both positions. Directors and years for the IMDb-only entries were filled
-    in by hand, so treat those as the likeliest weak spot.
+    in by hand, so treat those as the likeliest weak spot. Poster art and film data, where shown,
+    come from TMDb; this product uses the TMDb API but is not endorsed or certified by TMDb.
   </p>
   <button class="ghost" data-close>Close</button>
 </div>
@@ -339,28 +365,30 @@ const FILMS = [{"id":"t1","title":"Citizen Kane","dir":"Orson Welles","year":"19
 
 /* ---------- state ---------- */
 const KEY = 'filmledger:v1';
+const POSTER_KEY = 'filmledger:posters:v1';
+const TMDB_KEY = 'filmledger:tmdbkey:v1';
 let state = { seen:{}, want:{}, note:{}, custom:[] };
 let storageOK = true;
 
 /* Saves to the phone's own browser storage, and also to Claude's store when
    the file is opened inside Claude, so the same file works in both places. */
 const store = {
-  async read(){
+  async read(key){
     if(window.storage){
-      try{ const r = await window.storage.get(KEY); if(r && r.value) return r.value; }catch(e){}
+      try{ const r = await window.storage.get(key); if(r && r.value) return r.value; }catch(e){}
     }
-    try{ return localStorage.getItem(KEY); }catch(e){ return null; }
+    try{ return localStorage.getItem(key); }catch(e){ return null; }
   },
-  async write(v){
+  async write(key, v){
     let ok = false;
-    if(window.storage){ try{ await window.storage.set(KEY, v); ok = true; }catch(e){} }
-    try{ localStorage.setItem(KEY, v); ok = true; }catch(e){}
+    if(window.storage){ try{ await window.storage.set(key, v); ok = true; }catch(e){} }
+    try{ localStorage.setItem(key, v); ok = true; }catch(e){}
     return ok;
   }
 };
 async function loadState(){
   try{
-    const raw = await store.read();
+    const raw = await store.read(KEY);
     if(raw) state = Object.assign({seen:{},want:{},note:{},custom:[]}, JSON.parse(raw));
   }catch(e){}
   try{ localStorage.setItem('filmledger:probe','1'); localStorage.removeItem('filmledger:probe'); }
@@ -370,9 +398,116 @@ let saveTimer = null;
 function save(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async ()=>{
-    const ok = await store.write(JSON.stringify(state));
+    const ok = await store.write(KEY, JSON.stringify(state));
     if(!ok){ storageOK = false; toast('Could not save — keep a backup'); }
   }, 400);
+}
+
+/* ---------- poster art (TMDb) ---------- */
+let tmdbKey = '';
+let tmdbKeyBad = false;
+let posterCache = {};   // filmId -> poster_path string, or '' if none found
+let posterSaveTimer = null;
+async function loadPosterState(){
+  try{ const raw = await store.read(TMDB_KEY); if(raw) tmdbKey = raw; }catch(e){}
+  try{ const raw = await store.read(POSTER_KEY); if(raw) posterCache = JSON.parse(raw); }catch(e){}
+}
+function savePosterCache(){
+  clearTimeout(posterSaveTimer);
+  posterSaveTimer = setTimeout(()=>{ store.write(POSTER_KEY, JSON.stringify(posterCache)); }, 500);
+}
+function posterURL(path, size){ return 'https://image.tmdb.org/t/p/'+(size||'w92')+path; }
+
+async function tmdbLookup(f){
+  const y = parseInt(String(f.year).slice(0,4), 10);
+  let url = 'https://api.themoviedb.org/3/search/movie?api_key=' + encodeURIComponent(tmdbKey)
+    + '&include_adult=false&query=' + encodeURIComponent(f.title);
+  if(isFinite(y)) url += '&year=' + y;
+  const res = await fetch(url);
+  if(res.status === 401 || res.status === 403){ tmdbKeyBad = true; throw new Error('bad key'); }
+  if(!res.ok) throw new Error('tmdb ' + res.status);
+  const data = await res.json();
+  const results = (data && data.results) || [];
+  let best = null;
+  for(const r of results){
+    if(!r.poster_path) continue;
+    if(!best) best = r;
+    const ry = r.release_date ? parseInt(r.release_date.slice(0,4), 10) : null;
+    if(ry && isFinite(y) && Math.abs(ry - y) <= 1){ best = r; break; }
+  }
+  return best ? best.poster_path : '';
+}
+
+let activeFetches = 0;
+const MAX_CONCURRENT_FETCHES = 4;
+const posterQueue = [];
+function schedulePosterFetch(f){
+  posterQueue.push(f);
+  pumpPosterQueue();
+}
+function pumpPosterQueue(){
+  while(activeFetches < MAX_CONCURRENT_FETCHES && posterQueue.length){
+    const f = posterQueue.shift();
+    activeFetches++;
+    tmdbLookup(f)
+      .then(path => { posterCache[f.id] = path || ''; })
+      .catch(() => {})   // leave uncached on error so it can retry on next view
+      .finally(() => {
+        activeFetches--;
+        savePosterCache();
+        applyPoster(f.id);
+        pumpPosterQueue();
+      });
+  }
+}
+function applyPoster(id){
+  const path = posterCache[id];
+  if(path === undefined) return;
+  document.querySelectorAll('.poster[data-id="'+id+'"]').forEach(el => {
+    if(path){
+      el.innerHTML = '<img src="'+posterURL(path)+'" alt="" loading="lazy" decoding="async">';
+      el.classList.add('has-art');
+    } else {
+      el.classList.add('none');
+    }
+  });
+}
+let posterObserver = null;
+function ensurePosterObserver(){
+  if(posterObserver) return posterObserver;
+  posterObserver = new IntersectionObserver(entries => {
+    entries.forEach(en => {
+      if(!en.isIntersecting) return;
+      const id = en.target.dataset.id;
+      if(posterCache[id] !== undefined){
+        posterObserver.unobserve(en.target);
+        applyPoster(id);
+        return;
+      }
+      if(!tmdbKey || tmdbKeyBad) return;  // stay observed; retryVisiblePosters() picks these up once a key is saved
+      posterObserver.unobserve(en.target);
+      const f = catalogue().find(x => x.id === id);
+      if(f) schedulePosterFetch(f);
+    });
+  }, { rootMargin: '500px 0px', threshold: 0.01 });
+  return posterObserver;
+}
+function observePosters(root){
+  const obs = ensurePosterObserver();
+  (root || document).querySelectorAll('.poster').forEach(el => {
+    const id = el.dataset.id;
+    if(posterCache[id] !== undefined) applyPoster(id);
+    else obs.observe(el);
+  });
+}
+function retryVisiblePosters(){
+  if(!tmdbKey || tmdbKeyBad) return;
+  document.querySelectorAll('.poster').forEach(el => {
+    const id = el.dataset.id;
+    if(posterCache[id] !== undefined){ applyPoster(id); return; }
+    const f = catalogue().find(x => x.id === id);
+    if(f) schedulePosterFetch(f);
+  });
 }
 
 /* ---------- helpers ---------- */
@@ -453,6 +588,7 @@ function renderPage(){
   shown += slice.length;
   $('#loadmore').hidden = shown >= filtered.length;
   $('#loadmore').textContent = 'Show ' + Math.min(PAGE, filtered.length - shown) + ' more';
+  observePosters($('#list'));
 }
 
 /* ---------- rendering ---------- */
@@ -467,6 +603,7 @@ function cardHTML(f){
   return '<li class="card'+(seen?' seen':'')+'" data-id="'+f.id+'">'
     + '<button class="mark" aria-pressed="'+(seen?'true':'false')+'" aria-label="'
       + (seen?'Mark as not seen':'Mark as seen')+'"><span class="box"></span></button>'
+    + '<div class="poster" data-id="'+f.id+'"><span class="pfallback">'+esc((f.title||'?').trim().charAt(0).toUpperCase())+'</span></div>'
     + '<button class="body" aria-expanded="false">'
       + '<div class="titleline">'+esc(f.title)+'<span class="yr">'+esc(f.year)+'</span></div>'
       + (meta ? '<div class="meta">'+esc(meta)+'</div>' : '')
@@ -491,8 +628,13 @@ function detailHTML(f){
   if(!f.mine)  rows.push(['Colour', f.bw ? 'Black and white' : 'Colour']);
   const seen = state.seen[f.id];
   if(seen && seen.d) rows.push(['Marked seen', prettyDate(seen.d)]);
+  const dl = '<dl>' + rows.map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('') + '</dl>';
+  const artPath = posterCache[f.id];
+  const body = artPath
+    ? '<div class="drow"><img class="dposter" src="'+posterURL(artPath,'w154')+'" alt="" loading="lazy">' + dl + '</div>'
+    : dl;
   return '<div class="detail">'
-    + '<dl>' + rows.map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('') + '</dl>'
+    + body
     + '<textarea placeholder="Notes — where you saw it, what you thought" data-note>'+esc(state.note[f.id]||'')+'</textarea>'
     + '<div class="dactions">'
       + '<button class="dbtn'+(state.want[f.id]?' on':'')+'" data-want>'+(state.want[f.id]?'On watchlist':'Add to watchlist')+'</button>'
@@ -530,6 +672,7 @@ $('#list').addEventListener('click', e => {
     } else {
       const open = card.querySelector('.detail');
       card.outerHTML = cardHTML(f).replace('</li>', (open ? detailHTML(f) : '') + '</li>');
+      observePosters(document);
     }
     return;
   }
@@ -544,6 +687,7 @@ $('#list').addEventListener('click', e => {
     if(state.want[id]) delete state.want[id]; else state.want[id] = 1;
     save(); refreshCounts();
     card.outerHTML = cardHTML(f).replace('</li>', detailHTML(f) + '</li>');
+    observePosters(document);
     return;
   }
   if(e.target.closest('[data-del]')){
@@ -588,7 +732,14 @@ function closeSheets(){ $('#scrim').classList.remove('open');
 $('#scrim').addEventListener('click', closeSheets);
 document.querySelectorAll('[data-close]').forEach(b=>b.addEventListener('click', closeSheets));
 $('#btn-add').addEventListener('click', ()=>openSheet('#sheet-add'));
-$('#btn-menu').addEventListener('click', ()=>{ buildStats(); openSheet('#sheet-menu'); });
+$('#btn-menu').addEventListener('click', ()=>{ buildStats(); $('#m-tmdb').value = tmdbKey; openSheet('#sheet-menu'); });
+$('#m-tmdb-save').addEventListener('click', async ()=>{
+  const v = $('#m-tmdb').value.trim();
+  tmdbKey = v; tmdbKeyBad = false;
+  await store.write(TMDB_KEY, v);
+  if(v){ toast('Key saved — posters will start loading'); retryVisiblePosters(); }
+  else toast('Key cleared');
+});
 
 $('#a-save').addEventListener('click', ()=>{
   const title = $('#a-title').value.trim();
@@ -665,7 +816,7 @@ function fillSelects(){
 }
 (async function(){
   fillSelects();
-  await loadState();
+  await Promise.all([loadState(), loadPosterState()]);
   refreshCounts();
   applyFilters();
   if(!storageOK) toast('Storage unavailable — ticks will not persist');
